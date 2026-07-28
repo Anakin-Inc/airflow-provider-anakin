@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "airflow-provider-anakin"
+version = "0.1.0"
+description = "Apache Airflow provider for Anakin — web scraping, AI search, and agentic research"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: Apache Airflow",
+    "Framework :: Apache Airflow :: Provider",
+    "Topic :: System :: Monitoring",
+]
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "apache-airflow>=2.7.0",
+    "anakin-sdk>=0.1.0,<0.2.0",
+]
+
+# Tells Airflow's provider manager where to find this package's metadata.
+# Entry-point group name ("apache_airflow_provider") and target shape
+# ("<module>:get_provider_info") confirmed against Airflow's own
+# "Creating a custom provider" docs and the astronomer/airflow-provider-sample
+# reference implementation's pyproject.toml — not guessed.
+[project.entry-points.apache_airflow_provider]
+provider_info = "anakin_provider:get_provider_info"
+
+[project.urls]
+Homepage = "https://anakin.io"
+Documentation = "https://anakin.io/docs"
+Repository = "https://github.com/Anakin-Inc/anakin-airflow-provider"
+Issues = "https://github.com/Anakin-Inc/anakin-airflow-provider/issues"
+
+[dependency-groups]
+test = [
+    "pytest>=8.0.0,<9.0.0",
+    "pytest-mock>=3.10.0,<4.0.0",
+]
+typing = [
+    "mypy>=1.10.0,<2.0.0",
+]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers --strict-config"
+
+[tool.mypy]
+disallow_untyped_defs = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["anakin_provider"]
