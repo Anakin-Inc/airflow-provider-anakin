@@ -14,7 +14,7 @@ dotted paths returned below.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def get_provider_info() -> dict:
@@ -30,10 +30,15 @@ def get_provider_info() -> dict:
         "package-name": "airflow-provider-anakin",
         "name": "Anakin",
         "description": (
-            "Web scraping, AI-powered search, and multi-stage agentic "
-            "research for Apache Airflow, backed by the Anakin API "
-            "(https://api.anakin.io/v1) via the official ``anakin-sdk`` "
-            "Python client — this provider does not reimplement HTTP calls."
+            "Full coverage of the Anakin API (https://api.anakin.io/v1) for "
+            "Apache Airflow: web scraping, site mapping/crawling, AI-powered "
+            "search and multi-stage agentic research, Wire pre-built site "
+            "automations, website change monitoring, AI-visibility (LLM "
+            "answer-engine) search, browser-session management, and AI "
+            "browser automation. Built on the official ``anakin-sdk`` "
+            "Python client where it covers an endpoint, with direct HTTP "
+            "calls (reusing the SDK's authenticated transport) for the "
+            "handful of endpoints the SDK does not wrap yet."
         ),
         "versions": [__version__],
         "integrations": [

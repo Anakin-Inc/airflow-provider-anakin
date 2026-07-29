@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "airflow-provider-anakin"
-version = "0.1.0"
-description = "Apache Airflow provider for Anakin — web scraping, AI search, and agentic research"
+version = "0.2.0"
+description = "Apache Airflow provider for the full Anakin API — scraping, mapping/crawling, search, Wire automations, monitoring, AI visibility, sessions, and browser automation"
 license = { text = "Apache-2.0" }
 readme = "README.md"
 classifiers = [

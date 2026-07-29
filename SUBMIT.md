@@ -1,5 +1,120 @@
 # airflow-provider-anakin — verification status
 
+## Extension pass: full 21/21 API coverage (feat/full-tool-coverage)
+
+The original build (`main`, `0.1.0`) covered 3 of Anakin's 21 API
+capabilities: `scrape`, `search`, `agentic_search`. This branch adds the
+remaining 18 as new Operators, bringing coverage to 21/21. `__version__`
+bumped to `0.2.0` (feature addition, semver minor).
+
+**Ground truth for this pass**, read directly, not recalled or guessed:
+
+- `anakin-py/src/anakin/client.py` (the real, current `anakin-sdk` v0.1.0
+  Python client) — for exactly which of the 18 already have a public SDK
+  method, and their real signatures.
+- `anakin-mcp/src/client.ts` and `anakin-mcp/src/tools/{wire,monitor,
+  ai-visibility,browser-task,sessions}.ts` (Anakin's own MCP server) — for
+  the REST endpoints, request bodies, and response shapes of the 18
+  capabilities, since that server talks to the exact same
+  `https://api.anakin.io/v1` this provider does.
+
+**Two corrections to the task brief's own ground-truth summary, found by
+reading the code rather than trusting the summary at face value:**
+
+1. **`session_list`/`session_delete` ARE in `anakin-sdk`.** The brief
+   stated these were confirmed missing from `client.py` "in earlier
+   research this session." Reading `client.py` directly in *this* pass
+   shows `Anakin.sessions` is a `SessionsClient` sub-namespace with
+   `list(domain=None)` and `delete(session_id)` methods, both real and
+   public. `AnakinHook.session_list()`/`session_delete()` delegate to them
+   — no raw HTTP for these two, unlike the brief's suggested grouping with
+   monitor/ai-visibility/browser-task.
+2. **The "wire family" is one SDK method, not seven.** `Anakin.wire
+   (action_id, params, poll_timeout=None)` is the only Wire method
+   `anakin-sdk` v0.1.0 exposes — it covers `POST /wire/task` + polling
+   `GET /wire/jobs/:id` (action *execution* only). `wire_discover`
+   (`GET /wire/resolve`), `wire_catalog` (`GET /wire/catalog[/:slug]`),
+   `wire_identities` (`GET /wire/identities`), `wire_login`
+   (`POST /wire/login`), and `wire_build` (`POST /wire/build-request`) have
+   **no** SDK method as of v0.1.0 — confirmed by reading `client.py`
+   top-to-bottom, not by absence of a grep hit. `wire_read_action`/
+   `wire_write_action` (both operators) delegate to the one real
+   `Anakin.wire()` method — mirroring how `anakin-mcp`'s own
+   `wire_read_action`/`wire_write_action` tools share one `runWireAction()`
+   implementation and differ only in their safety annotation. The other
+   five are raw HTTP.
+3. **A real, surfaced SDK gap, not silently worked around:** the REST API
+   (per `anakin-mcp/src/client.ts`'s `wireRun`) accepts `credential_id`/
+   `identity_id` on Wire action execution, for actions whose `auth_mode` is
+   `"required"`/`"optional"`. `anakin-sdk` v0.1.0's `Anakin.wire()` does
+   not expose either parameter — its request body is only
+   `{action_id, params}`. Rather than bypass the SDK with a parallel raw-
+   HTTP path for just this one field (which would violate the "reuse the
+   SDK, don't reimplement" instruction the moment an auth-required action
+   was needed), `AnakinWireReadActionOperator`/`AnakinWireWriteActionOperator`
+   currently only support `auth_mode: "none"` actions, documented in both
+   operators' docstrings and the README. Revisit once `anakin-sdk` adds
+   the parameters.
+
+**Endpoints with no SDK method** (`wire_discover`, `wire_catalog`,
+`wire_identities`, `wire_login`, `wire_build`, `monitor_create`,
+`monitor_list`, `monitor_changes`, `monitor_control`,
+`ai_visibility_sources`, `ai_visibility_search`, `browser_task` — 12 of the
+18) are reached via `AnakinHook._raw_http()`, which returns
+`anakin.Anakin()._http` — the SDK client's own internal, already-
+authenticated `httpx`-backed `HttpClient` (auth header injection,
+exponential-backoff retry on 429/5xx, `Retry-After` handling, and — for
+`ai_visibility_search`/`browser_task` — its existing `poll()` helper reused
+for the two endpoints' own async-job shapes). This is a deliberate,
+documented reach into a `_`-prefixed internal (flagged with `# noqa: SLF001`
+and explained in the hook's own docstring), not a second hand-rolled HTTP
+client — made safe by this package's existing `anakin-sdk>=0.1.0,<0.2.0`
+pin. Endpoint paths/bodies for all 12 were read from `anakin-mcp`'s
+`client.ts`/`tools/*.ts`, cross-checked against each other (e.g.
+`monitor_control`'s `run_now` action posts to `.../run`, not `.../run_now`
+— confirmed from `client.ts`'s `monitorControl` switch statement, not
+guessed from the action name).
+
+**MCP-layer policy checks intentionally NOT replicated here:**
+`anakin-mcp`'s `wire_write_action`/`wire_build`/`browser_task` tools run a
+`financialBlockReason()` content filter (refusing payment/fund-transfer
+instructions) because that server exposes these as tools to an autonomous
+LLM agent acting on open-ended natural-language input. This provider's
+operators are authored by a trusted engineer in a DAG file, not driven by
+an LLM's own judgment call on each invocation — so that guardrail is an
+MCP-specific safety layer, not part of the REST API contract itself, and
+out of scope for an orchestration provider. Noted here rather than silently
+dropped.
+
+**Verification performed for this pass:**
+
+- All 13 source files (`anakin_provider/**/*.py`, `example_dags/*.py`,
+  `tests/*.py`) — the original 10 plus the new
+  `example_dags/example_anakin_advanced.py` and the two edited test files —
+  pass `python3 -m py_compile`.
+- `get_provider_info()` re-executed standalone after every edit (zero
+  Airflow/anakin-sdk imports preserved by design — see its own module
+  docstring): confirmed `__version__` reads `"0.2.0"`,
+  `info["versions"] == ["0.2.0"]`, and `operators`/`connection-types` still
+  point at the real `anakin_provider.operators.anakin` /
+  `anakin_provider.hooks.anakin.AnakinHook` paths (unchanged — new
+  operators live in the same module, so no path-list update was needed
+  there; only the `description` text was expanded to name the full
+  capability set).
+- 18 new operator classes, one per capability, added to
+  `anakin_provider/operators/anakin.py`; 12 new hook methods (map, crawl,
+  wire_read_action, wire_write_action are 4 of the 18 backed by existing
+  SDK methods reused as-is) plus `_raw_http()` added to
+  `anakin_provider/hooks/anakin.py`.
+- Tests: extended `tests/test_hooks.py` (new tests for every new hook
+  method, including exact-body assertions for the 12 raw-HTTP endpoints)
+  and `tests/test_operators.py` (one wiring test per new operator, plus two
+  for `AnakinAiVisibilitySearchOperator`'s `include_full_content` XCom-size
+  guard) — same mocking pattern as the original 9 tests (patch
+  `AnakinHook`/`Anakin`/`BaseHook.get_connection`, no network access
+  needed). **Written but not run** for the same reason as the original
+  pass — see "What's NOT verified" below, which still applies unchanged.
+
 ## Live-verified, not assumed
 
 - `anakin-sdk` is **live on PyPI right now** (confirmed via
