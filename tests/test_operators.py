@@ -3,21 +3,32 @@
 Mocks `AnakinHook` entirely (patched where each operator module looks it
 up) — these test the operator <-> hook wiring (constructor args passed
 through, XCom-safe dict returned via model_dump), not the hook or SDK
-themselves. Requires `apache-airflow` and `anakin-sdk` installed to *run*;
-see SUBMIT.md.
+themselves.
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import json
+from unittest.mock import patch
 
+import pytest
 from anakin.models import (
     AgenticSearchResult,
+    AIVisibilitySearch,
+    AIVisibilitySource,
     BrowserSession,
     CrawlResult,
     Document,
     MapResult,
+    Monitor,
+    MonitorChange,
+    MonitorRun,
     SearchResult,
+    WireActionMatch,
+    WireBuildRequest,
+    WireCatalogDetail,
+    WireIdentity,
+    WireLoginResult,
     WireResult,
 )
 
@@ -37,6 +48,7 @@ from anakin_provider.operators.anakin import (
     AnakinSessionDeleteOperator,
     AnakinSessionListOperator,
     AnakinWireBuildOperator,
+    AnakinWireBuildStatusOperator,
     AnakinWireCatalogOperator,
     AnakinWireDiscoverOperator,
     AnakinWireIdentitiesOperator,
@@ -84,9 +96,7 @@ def test_search_operator_execute_returns_json_safe_dict() -> None:
 
     assert result["id"] == "job_2"
     assert result["results"] == []
-    mock_hook_cls.return_value.search.assert_called_once_with(
-        "latest AI agents", limit=3
-    )
+    mock_hook_cls.return_value.search.assert_called_once_with("latest AI agents", limit=3)
 
 
 def test_agentic_search_operator_execute_returns_json_safe_dict() -> None:
@@ -160,99 +170,134 @@ def test_crawl_operator_execute_returns_json_safe_dict() -> None:
 # ─── wire ──────────────────────────────────────────────────────────────────
 
 
-def test_wire_discover_operator_returns_raw_dict() -> None:
-    op = AnakinWireDiscoverOperator(task_id="wire_discover", q="top phones on walmart", limit=3)
+def test_wire_discover_operator_returns_list_of_dicts() -> None:
+    op = AnakinWireDiscoverOperator(
+        task_id="wire_discover", q="top phones on walmart", auth_mode="none", limit=3
+    )
+    match = WireActionMatch(action_id="walmart.search", catalog_slug="walmart", credits=2)
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.wire_discover.return_value = {"results": []}
+        mock_hook_cls.return_value.wire_discover.return_value = [match]
         result = op.execute(context={})
 
-    assert result == {"results": []}
+    assert result[0]["action_id"] == "walmart.search"
+    json.dumps(result)
     mock_hook_cls.return_value.wire_discover.assert_called_once_with(
-        "top phones on walmart", limit=3
+        "top phones on walmart", catalog=None, category=None, auth_mode="none", limit=3
     )
 
 
-def test_wire_catalog_operator_returns_raw_dict() -> None:
+def test_wire_catalog_operator_returns_dict() -> None:
     op = AnakinWireCatalogOperator(task_id="wire_catalog", slug="walmart")
+    detail = WireCatalogDetail.model_validate(
+        {"catalog": {"id": "cat_1", "slug": "walmart", "name": "Walmart"}, "actions": []}
+    )
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.wire_catalog.return_value = {"actions": []}
+        mock_hook_cls.return_value.wire_catalog.return_value = detail
         result = op.execute(context={})
 
-    assert result == {"actions": []}
+    assert result["actions"] == []
     mock_hook_cls.return_value.wire_catalog.assert_called_once_with("walmart")
 
 
-def test_wire_read_action_operator_returns_json_safe_dict() -> None:
-    op = AnakinWireReadActionOperator(
-        task_id="wire_read", action_id="walmart.search_products", params={"q": "phones"}
+@pytest.mark.parametrize(
+    ("operator_cls", "hook_method"),
+    [
+        (AnakinWireReadActionOperator, "wire_read_action"),
+        (AnakinWireWriteActionOperator, "wire_write_action"),
+    ],
+)
+def test_wire_action_operators_pass_params_and_credentials(operator_cls, hook_method) -> None:
+    op = operator_cls(
+        task_id="wire",
+        action_id="walmart.search_products",
+        action_params={"q": "phones"},
+        credential_id="cred_1",
     )
     wire_result = WireResult(job_id="job_wire", status="completed", data={"items": []})
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.wire_read_action.return_value = wire_result
+        getattr(mock_hook_cls.return_value, hook_method).return_value = wire_result
         result = op.execute(context={})
 
     assert result["job_id"] == "job_wire"
     assert result["data"] == {"items": []}
-    mock_hook_cls.return_value.wire_read_action.assert_called_once_with(
-        "walmart.search_products", {"q": "phones"}, poll_timeout=None
+    getattr(mock_hook_cls.return_value, hook_method).assert_called_once_with(
+        "walmart.search_products",
+        {"q": "phones"},
+        credential_id="cred_1",
+        identity_id=None,
+        poll_timeout=None,
     )
 
 
-def test_wire_write_action_operator_returns_json_safe_dict() -> None:
-    op = AnakinWireWriteActionOperator(
-        task_id="wire_write", action_id="walmart.add_to_cart", params={"sku": "123"}
+def test_wire_action_params_do_not_collide_with_airflow_params() -> None:
+    """``params`` is reserved by Airflow (DAG/task Params, merged at run
+    time); action input must live in its own attribute."""
+    op = AnakinWireReadActionOperator(
+        task_id="wire", action_id="a.b", action_params={"q": "x"}, params={"env": "prod"}
     )
-    wire_result = WireResult(job_id="job_wire_2", status="completed")
-    with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.wire_write_action.return_value = wire_result
-        result = op.execute(context={})
-
-    assert result["job_id"] == "job_wire_2"
-    mock_hook_cls.return_value.wire_write_action.assert_called_once_with(
-        "walmart.add_to_cart", {"sku": "123"}, poll_timeout=None
-    )
+    assert op.action_params == {"q": "x"}
+    assert "q" not in op.params
 
 
-def test_wire_identities_operator_returns_raw_dict() -> None:
+def test_wire_identities_operator_returns_list_of_dicts() -> None:
     op = AnakinWireIdentitiesOperator(task_id="wire_identities", catalog_id="cat_1")
+    identity = WireIdentity.model_validate({"id": "idn_1", "credentials": []})
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.wire_identities.return_value = {"identities": []}
+        mock_hook_cls.return_value.wire_identities.return_value = [identity]
         result = op.execute(context={})
 
-    assert result == {"identities": []}
+    assert result[0]["id"] == "idn_1"
     mock_hook_cls.return_value.wire_identities.assert_called_once_with("cat_1")
 
 
-def test_wire_login_operator_returns_raw_dict() -> None:
+def test_wire_login_operator_returns_dict() -> None:
     op = AnakinWireLoginOperator(
-        task_id="wire_login", catalog_slug="neb", params={"email": "a@b.com", "password": "x"}
+        task_id="wire_login", catalog_slug="neb", login_params={"email": "a@b.com", "password": "x"}
     )
+    login = WireLoginResult(status="connected", identity_id="idn_1", credential_id="cred_1")
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.wire_login.return_value = {"credential_id": "cred_1"}
+        mock_hook_cls.return_value.wire_login.return_value = login
         result = op.execute(context={})
 
-    assert result == {"credential_id": "cred_1"}
+    assert result["credential_id"] == "cred_1"
     mock_hook_cls.return_value.wire_login.assert_called_once_with(
         "neb",
-        params={"email": "a@b.com", "password": "x"},
+        {"email": "a@b.com", "password": "x"},
         identity_name=None,
         source_id=None,
         source_ref=None,
     )
 
 
-def test_wire_build_operator_returns_raw_dict() -> None:
+def test_wire_build_and_status_operators() -> None:
+    build = WireBuildRequest(id="build_1", status="pending")
     op = AnakinWireBuildOperator(
         task_id="wire_build", website_url="https://example.com", goal="extract prices"
     )
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.wire_build.return_value = {"status": "pending"}
+        mock_hook_cls.return_value.wire_build.return_value = build
         result = op.execute(context={})
 
-    assert result == {"status": "pending"}
+    assert result["id"] == "build_1"
     mock_hook_cls.return_value.wire_build.assert_called_once_with(
-        "https://example.com", "extract prices", catalog_id=None, visibility=None, force=None
+        "https://example.com",
+        "extract prices",
+        actions=None,
+        catalog_id=None,
+        country=None,
+        visibility=None,
+        force=False,
     )
+
+    status_op = AnakinWireBuildStatusOperator(task_id="wire_build_status", build_id="build_1")
+    with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
+        mock_hook_cls.return_value.wire_build_status.return_value = WireBuildRequest(
+            id="build_1", status="published", action_id="example.prices"
+        )
+        result = status_op.execute(context={})
+
+    assert result["action_id"] == "example.prices"
+    mock_hook_cls.return_value.wire_build_status.assert_called_once_with("build_1")
 
 
 # ─── website monitoring ──────────────────────────────────────────────────────
@@ -267,10 +312,12 @@ def test_monitor_create_operator_passes_through_all_fields() -> None:
         ai_mode=True,
     )
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.monitor_create.return_value = {"id": "mon_1"}
+        mock_hook_cls.return_value.monitor_create.return_value = Monitor(
+            id="mon_1", url="https://example.com"
+        )
         result = op.execute(context={})
 
-    assert result == {"id": "mon_1"}
+    assert result["id"] == "mon_1"
     mock_hook_cls.return_value.monitor_create.assert_called_once_with(
         "https://example.com",
         60,
@@ -299,52 +346,75 @@ def test_monitor_create_operator_passes_through_all_fields() -> None:
     )
 
 
-def test_monitor_list_operator_returns_raw_dict() -> None:
-    op = AnakinMonitorListOperator(task_id="monitor_list")
+def test_monitor_list_and_changes_operators_return_lists() -> None:
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.monitor_list.return_value = {"monitors": []}
-        result = op.execute(context={})
+        mock_hook_cls.return_value.monitor_list.return_value = [
+            Monitor(id="mon_1", url="https://example.com")
+        ]
+        mock_hook_cls.return_value.monitor_changes.return_value = [MonitorChange(id="chg_1")]
+        listed = AnakinMonitorListOperator(task_id="monitor_list").execute(context={})
+        changes = AnakinMonitorChangesOperator(
+            task_id="monitor_changes", monitor_id="mon_1"
+        ).execute(context={})
 
-    assert result == {"monitors": []}
-    mock_hook_cls.return_value.monitor_list.assert_called_once_with()
-
-
-def test_monitor_changes_operator_returns_raw_dict() -> None:
-    op = AnakinMonitorChangesOperator(task_id="monitor_changes", monitor_id="mon_1")
-    with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.monitor_changes.return_value = {"changes": []}
-        result = op.execute(context={})
-
-    assert result == {"changes": []}
+    assert [m["id"] for m in listed] == ["mon_1"]
+    assert [c["id"] for c in changes] == ["chg_1"]
     mock_hook_cls.return_value.monitor_changes.assert_called_once_with("mon_1")
 
 
 def test_monitor_control_operator_passes_through_action() -> None:
-    op = AnakinMonitorControlOperator(task_id="monitor_control", monitor_id="mon_1", action="pause")
+    op = AnakinMonitorControlOperator(
+        task_id="monitor_control", monitor_id="mon_1", action="run_now"
+    )
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.monitor_control.return_value = {"status": "paused"}
+        mock_hook_cls.return_value.monitor_control.return_value = MonitorRun(
+            success=True, job_id="job_1"
+        )
         result = op.execute(context={})
 
-    assert result == {"status": "paused"}
-    mock_hook_cls.return_value.monitor_control.assert_called_once_with("mon_1", "pause")
+    assert result["job_id"] == "job_1"
+    mock_hook_cls.return_value.monitor_control.assert_called_once_with("mon_1", "run_now")
+
+
+def test_monitor_control_operator_delete_returns_confirmation() -> None:
+    op = AnakinMonitorControlOperator(task_id="monitor_delete", monitor_id="mon_1", action="delete")
+    with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
+        mock_hook_cls.return_value.monitor_control.return_value = None
+        result = op.execute(context={})
+
+    assert result == {"monitor_id": "mon_1", "deleted": True}
 
 
 # ─── AI visibility ────────────────────────────────────────────────────────────
 
 
+def _ai_search() -> AIVisibilitySearch:
+    return AIVisibilitySearch.model_validate(
+        {
+            "search_id": "srch_1",
+            "status": "completed",
+            "results": [
+                {
+                    "source": "chatgpt",
+                    "status": "completed",
+                    "summary": "...",
+                    "full_content": "very long",
+                }
+            ],
+        }
+    )
+
+
 def test_ai_visibility_search_operator_strips_full_content_by_default() -> None:
     op = AnakinAiVisibilitySearchOperator(task_id="ai_vis_search", query="what is anakin?")
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.ai_visibility_search.return_value = {
-            "search_id": "srch_1",
-            "status": "completed",
-            "results": [{"source": "chatgpt", "summary": "...", "full_content": "very long text"}],
-        }
+        mock_hook_cls.return_value.ai_visibility_search.return_value = _ai_search()
         result = op.execute(context={})
 
-    assert result["results"] == [{"source": "chatgpt", "summary": "..."}]
+    assert "full_content" not in result["results"][0]
+    assert result["results"][0]["summary"] == "..."
     mock_hook_cls.return_value.ai_visibility_search.assert_called_once_with(
-        "what is anakin?", sources=None, country=None, poll_timeout=None
+        "what is anakin?", sources=None, country="us", poll_timeout=None
     )
 
 
@@ -353,21 +423,21 @@ def test_ai_visibility_search_operator_keeps_full_content_when_requested() -> No
         task_id="ai_vis_search_full", query="what is anakin?", include_full_content=True
     )
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.ai_visibility_search.return_value = {
-            "results": [{"source": "chatgpt", "full_content": "very long text"}],
-        }
+        mock_hook_cls.return_value.ai_visibility_search.return_value = _ai_search()
         result = op.execute(context={})
 
-    assert result["results"] == [{"source": "chatgpt", "full_content": "very long text"}]
+    assert result["results"][0]["full_content"] == "very long"
 
 
-def test_ai_visibility_sources_operator_returns_raw_dict() -> None:
+def test_ai_visibility_sources_operator_returns_list_of_dicts() -> None:
     op = AnakinAiVisibilitySourcesOperator(task_id="ai_vis_sources")
     with patch("anakin_provider.operators.anakin.AnakinHook") as mock_hook_cls:
-        mock_hook_cls.return_value.ai_visibility_sources.return_value = {"sources": []}
+        mock_hook_cls.return_value.ai_visibility_sources.return_value = [
+            AIVisibilitySource.model_validate({"slug": "chatgpt", "label": "ChatGPT"})
+        ]
         result = op.execute(context={})
 
-    assert result == {"sources": []}
+    assert result[0]["slug"] == "chatgpt"
 
 
 # ─── browser sessions ─────────────────────────────────────────────────────────

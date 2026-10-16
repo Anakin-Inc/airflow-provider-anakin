@@ -32,3 +32,9 @@ def test_get_provider_info_operators_point_at_real_module_path() -> None:
     info = get_provider_info()
     [operators_entry] = info["operators"]
     assert operators_entry["python-modules"] == ["anakin_provider.operators.anakin"]
+
+
+def test_get_provider_info_declares_connection_form_for_airflow_3() -> None:
+    [conn_type] = get_provider_info()["connection-types"]
+    assert conn_type["ui-field-behaviour"]["relabeling"] == {"password": "API Key"}
+    assert "base_url" in conn_type["conn-fields"]

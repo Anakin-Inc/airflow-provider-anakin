@@ -14,10 +14,12 @@ dotted paths returned below.
 
 from __future__ import annotations
 
+from typing import Any
+
 __version__ = "0.2.0"
 
 
-def get_provider_info() -> dict:
+def get_provider_info() -> dict[str, Any]:
     """Return provider metadata conforming to Airflow's provider_info schema.
 
     Structure (package-name/name/description/versions/integrations/
@@ -30,15 +32,10 @@ def get_provider_info() -> dict:
         "package-name": "airflow-provider-anakin",
         "name": "Anakin",
         "description": (
-            "Full coverage of the Anakin API (https://api.anakin.io/v1) for "
-            "Apache Airflow: web scraping, site mapping/crawling, AI-powered "
-            "search and multi-stage agentic research, Wire pre-built site "
-            "automations, website change monitoring, AI-visibility (LLM "
-            "answer-engine) search, browser-session management, and AI "
-            "browser automation. Built on the official ``anakin-sdk`` "
-            "Python client where it covers an endpoint, with direct HTTP "
-            "calls (reusing the SDK's authenticated transport) for the "
-            "handful of endpoints the SDK does not wrap yet."
+            "Operators and a hook for the Anakin API (https://anakin.io): "
+            "scrape, map, crawl, search, agentic search, Wire site actions, "
+            "website monitors, AI visibility, browser sessions and AI browser "
+            "tasks. Built on the official anakin-sdk Python client."
         ),
         "versions": [__version__],
         "integrations": [
@@ -53,6 +50,20 @@ def get_provider_info() -> dict:
                 "connection-type": "anakin",
                 "hook-class-name": "anakin_provider.hooks.anakin.AnakinHook",
                 "hook-name": "Anakin",
+                # Connection form metadata for Airflow 3's UI. Airflow 2 builds
+                # the form from AnakinHook.get_ui_field_behaviour() instead.
+                "ui-field-behaviour": {
+                    "hidden-fields": ["schema", "login", "port", "host"],
+                    "relabeling": {"password": "API Key"},
+                    "placeholders": {"password": "ask_..."},
+                },
+                "conn-fields": {
+                    "base_url": {
+                        "label": "Base URL",
+                        "description": "Defaults to https://api.anakin.io/v1 if left blank.",
+                        "schema": {"type": ["string", "null"]},
+                    }
+                },
             }
         ],
         "operators": [

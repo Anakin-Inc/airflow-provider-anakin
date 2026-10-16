@@ -13,12 +13,26 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from airflow.models import BaseOperator
+try:  # Airflow 3
+    from airflow.sdk import BaseOperator
+except ImportError:  # Airflow 2
+    from airflow.models import BaseOperator  # type: ignore[no-redef,assignment]
 
 from anakin_provider.hooks.anakin import AnakinHook
 
 if TYPE_CHECKING:
-    from airflow.utils.context import Context
+    from airflow.sdk import Context
+
+
+def _to_xcom(value: Any) -> Any:
+    """Convert SDK results (Pydantic models, or lists of them) to plain JSON
+    data for Airflow's default JSON XCom backend. ``mode="json"`` turns
+    ``datetime`` fields into ISO strings."""
+    if isinstance(value, list):
+        return [_to_xcom(v) for v in value]
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return value
 
 
 class AnakinScrapeOperator(BaseOperator):
@@ -321,6 +335,10 @@ class AnakinWireDiscoverOperator(BaseOperator):
 
     :param q: The intent in natural language, e.g. ``"top phones on
         walmart"``. Templated.
+    :param catalog: Restrict to one catalog slug, e.g. ``"walmart"``.
+    :param category: Restrict to one action category.
+    :param auth_mode: Restrict by auth mode: ``"none"``, ``"optional"`` or
+        ``"required"``.
     :param limit: Maximum number of candidate actions to return.
     :param anakin_conn_id: Airflow connection id for :class:`AnakinHook`.
     """
@@ -332,18 +350,31 @@ class AnakinWireDiscoverOperator(BaseOperator):
         self,
         *,
         q: str,
+        catalog: str | None = None,
+        category: str | None = None,
+        auth_mode: str | None = None,
         limit: int | None = None,
         anakin_conn_id: str = AnakinHook.default_conn_name,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.q = q
+        self.catalog = catalog
+        self.category = category
+        self.auth_mode = auth_mode
         self.limit = limit
         self.anakin_conn_id = anakin_conn_id
 
-    def execute(self, context: Context) -> dict[str, Any]:
+    def execute(self, context: Context) -> list[dict[str, Any]]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.wire_discover(self.q, limit=self.limit)
+        matches = hook.wire_discover(
+            self.q,
+            catalog=self.catalog,
+            category=self.category,
+            auth_mode=self.auth_mode,
+            limit=self.limit,
+        )
+        return _to_xcom(matches)  # type: ignore[no-any-return]
 
 
 class AnakinWireCatalogOperator(BaseOperator):
@@ -372,9 +403,9 @@ class AnakinWireCatalogOperator(BaseOperator):
         self.slug = slug
         self.anakin_conn_id = anakin_conn_id
 
-    def execute(self, context: Context) -> dict[str, Any]:
+    def execute(self, context: Context) -> Any:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.wire_catalog(self.slug)
+        return _to_xcom(hook.wire_catalog(self.slug))
 
 
 class AnakinWireReadActionOperator(BaseOperator):
@@ -389,42 +420,54 @@ class AnakinWireReadActionOperator(BaseOperator):
     :class:`AnakinWireCatalogOperator` and confirm the action's type is
     ``"read"``. Pushes the :class:`anakin.models.WireResult` to XCom.
 
-    .. note::
-       ``anakin-sdk`` v0.1.0 does not yet expose ``credential_id``/
-       ``identity_id`` on ``Anakin.wire()``, so this operator currently
-       only supports actions whose ``auth_mode`` is ``"none"``. See
-       SUBMIT.md for detail.
-
     :param action_id: The action to run (from Wire discovery/catalog). Templated.
-    :param params: The action's input parameters (shape depends on the
-        action — use its schema from discovery). Templated.
+    :param action_params: The action's input parameters (shape depends on
+        the action — use its schema from discovery). Templated. Named
+        ``action_params`` because ``params`` is reserved by Airflow.
+    :param credential_id: Required when the action's ``auth_mode`` is
+        ``"required"`` (from :class:`AnakinWireIdentitiesOperator` or
+        :class:`AnakinWireLoginOperator`). Templated.
+    :param identity_id: Optional identity to run the action as. Templated.
     :param poll_timeout: Seconds to wait for the job to finish; falls back
         to the SDK client's own default (300s) when unset.
     :param anakin_conn_id: Airflow connection id for :class:`AnakinHook`.
     """
 
-    template_fields: Sequence[str] = ("action_id", "params")
+    template_fields: Sequence[str] = (
+        "action_id",
+        "action_params",
+        "credential_id",
+        "identity_id",
+    )
     ui_color = "#6b4fbb"
 
     def __init__(
         self,
         *,
         action_id: str,
-        params: dict[str, Any] | None = None,
+        action_params: dict[str, Any] | None = None,
+        credential_id: str | None = None,
+        identity_id: str | None = None,
         poll_timeout: float | None = None,
         anakin_conn_id: str = AnakinHook.default_conn_name,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.action_id = action_id
-        self.params = params
+        self.action_params = action_params
+        self.credential_id = credential_id
+        self.identity_id = identity_id
         self.poll_timeout = poll_timeout
         self.anakin_conn_id = anakin_conn_id
 
     def execute(self, context: Context) -> dict[str, Any]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
         result = hook.wire_read_action(
-            self.action_id, self.params, poll_timeout=self.poll_timeout
+            self.action_id,
+            self.action_params,
+            credential_id=self.credential_id,
+            identity_id=self.identity_id,
+            poll_timeout=self.poll_timeout,
         )
         return result.model_dump(mode="json")
 
@@ -446,39 +489,52 @@ class AnakinWireWriteActionOperator(BaseOperator):
     and idempotency in your DAG. It does not execute payments or transfer
     funds (rejected by the Anakin API itself).
 
-    .. note::
-       Same ``credential_id``/``identity_id`` gap as
-       :class:`AnakinWireReadActionOperator` — see its docstring.
-
     :param action_id: The action to run (from Wire discovery/catalog). Templated.
-    :param params: The action's input parameters. Templated.
+    :param action_params: The action's input parameters. Templated. Named
+        ``action_params`` because ``params`` is reserved by Airflow.
+    :param credential_id: Required when the action's ``auth_mode`` is
+        ``"required"``. Templated.
+    :param identity_id: Optional identity to run the action as. Templated.
     :param poll_timeout: Seconds to wait for the job to finish; falls back
         to the SDK client's own default (300s) when unset.
     :param anakin_conn_id: Airflow connection id for :class:`AnakinHook`.
     """
 
-    template_fields: Sequence[str] = ("action_id", "params")
+    template_fields: Sequence[str] = (
+        "action_id",
+        "action_params",
+        "credential_id",
+        "identity_id",
+    )
     ui_color = "#6b4fbb"
 
     def __init__(
         self,
         *,
         action_id: str,
-        params: dict[str, Any] | None = None,
+        action_params: dict[str, Any] | None = None,
+        credential_id: str | None = None,
+        identity_id: str | None = None,
         poll_timeout: float | None = None,
         anakin_conn_id: str = AnakinHook.default_conn_name,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.action_id = action_id
-        self.params = params
+        self.action_params = action_params
+        self.credential_id = credential_id
+        self.identity_id = identity_id
         self.poll_timeout = poll_timeout
         self.anakin_conn_id = anakin_conn_id
 
     def execute(self, context: Context) -> dict[str, Any]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
         result = hook.wire_write_action(
-            self.action_id, self.params, poll_timeout=self.poll_timeout
+            self.action_id,
+            self.action_params,
+            credential_id=self.credential_id,
+            identity_id=self.identity_id,
+            poll_timeout=self.poll_timeout,
         )
         return result.model_dump(mode="json")
 
@@ -487,7 +543,7 @@ class AnakinWireIdentitiesOperator(BaseOperator):
     """List your saved Wire identities and their credentials.
 
     Submits ``GET /wire/identities``. Each credential's ``id`` is the
-    ``credential_id`` a future SDK release will accept on
+    ``credential_id`` to pass to
     :class:`AnakinWireReadActionOperator`/:class:`AnakinWireWriteActionOperator`
     for auth-required actions.
 
@@ -510,9 +566,9 @@ class AnakinWireIdentitiesOperator(BaseOperator):
         self.catalog_id = catalog_id
         self.anakin_conn_id = anakin_conn_id
 
-    def execute(self, context: Context) -> dict[str, Any]:
+    def execute(self, context: Context) -> list[dict[str, Any]]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.wire_identities(self.catalog_id)
+        return _to_xcom(hook.wire_identities(self.catalog_id))  # type: ignore[no-any-return]
 
 
 class AnakinWireLoginOperator(BaseOperator):
@@ -522,17 +578,19 @@ class AnakinWireLoginOperator(BaseOperator):
     only the resulting encrypted session.
 
     .. warning::
-       ``params`` typically carries login credentials (e.g. a password).
+       ``login_params`` typically carries login credentials (e.g. a password).
        Airflow renders templated fields and task logs in the UI and stores
        them in the metadata DB — pass secrets via an Airflow Connection/
        Variable backed by a Secrets Backend (not a literal DAG-file string)
        so they aren't written to the metadata DB or task logs in plaintext.
 
     :param catalog_slug: The catalog to sign in to, e.g. ``"walmart"``. Templated.
-    :param params: Login fields defined by the catalog's login schema (see
-        :class:`AnakinWireCatalogOperator`), e.g. ``{"email": ..., "password": ...}``.
+    :param login_params: Login fields defined by the catalog's login schema
+        (see :class:`AnakinWireCatalogOperator`), e.g.
+        ``{"email": ..., "password": ...}``. Not templated, so a rendered
+        password never lands in the "Rendered Template" view.
     :param identity_name: Optional name for the identity.
-    :param source_id: Optional 1Password identity-source ID (alternative to ``params``).
+    :param source_id: Optional 1Password identity-source ID (alternative to ``login_params``).
     :param source_ref: Optional 1Password item locator (used with ``source_id``).
     :param anakin_conn_id: Airflow connection id for :class:`AnakinHook`.
     """
@@ -544,7 +602,7 @@ class AnakinWireLoginOperator(BaseOperator):
         self,
         *,
         catalog_slug: str,
-        params: dict[str, Any] | None = None,
+        login_params: dict[str, Any] | None = None,
         identity_name: str | None = None,
         source_id: str | None = None,
         source_ref: dict[str, Any] | None = None,
@@ -553,7 +611,7 @@ class AnakinWireLoginOperator(BaseOperator):
     ) -> None:
         super().__init__(**kwargs)
         self.catalog_slug = catalog_slug
-        self.params = params
+        self.login_params = login_params
         self.identity_name = identity_name
         self.source_id = source_id
         self.source_ref = source_ref
@@ -561,13 +619,14 @@ class AnakinWireLoginOperator(BaseOperator):
 
     def execute(self, context: Context) -> dict[str, Any]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.wire_login(
+        result = hook.wire_login(
             self.catalog_slug,
-            params=self.params,
+            self.login_params,
             identity_name=self.identity_name,
             source_id=self.source_id,
             source_ref=self.source_ref,
         )
+        return result.model_dump(mode="json")
 
 
 class AnakinWireBuildOperator(BaseOperator):
@@ -584,8 +643,10 @@ class AnakinWireBuildOperator(BaseOperator):
     :param goal: Natural-language description of what the action should do
         or extract — be specific, the builder synthesizes the scraper from
         this. Templated.
+    :param actions: Optional list of specific capabilities to build.
     :param catalog_id: Optional — attach to an existing catalog instead of
         creating one.
+    :param country: Optional proxy country code for the build.
     :param visibility: ``"private"`` (default) or ``"public"``.
     :param force: Build even if similar actions already exist for the
         domain (otherwise rejected with ``ACTION_EXISTS``).
@@ -600,29 +661,66 @@ class AnakinWireBuildOperator(BaseOperator):
         *,
         website_url: str,
         goal: str,
+        actions: Sequence[str] | None = None,
         catalog_id: str | None = None,
+        country: str | None = None,
         visibility: str | None = None,
-        force: bool | None = None,
+        force: bool = False,
         anakin_conn_id: str = AnakinHook.default_conn_name,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.website_url = website_url
         self.goal = goal
+        self.actions = list(actions) if actions is not None else None
         self.catalog_id = catalog_id
+        self.country = country
         self.visibility = visibility
         self.force = force
         self.anakin_conn_id = anakin_conn_id
 
     def execute(self, context: Context) -> dict[str, Any]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.wire_build(
+        result = hook.wire_build(
             self.website_url,
             self.goal,
+            actions=self.actions,
             catalog_id=self.catalog_id,
+            country=self.country,
             visibility=self.visibility,
             force=self.force,
         )
+        return result.model_dump(mode="json")
+
+
+class AnakinWireBuildStatusOperator(BaseOperator):
+    """Check a Wire build request started by :class:`AnakinWireBuildOperator`.
+
+    Submits ``GET /wire/build-requests/:id``. Once ``status`` is
+    ``"published"``, ``action_id`` holds the new action, ready for
+    :class:`AnakinWireReadActionOperator`/:class:`AnakinWireWriteActionOperator`.
+
+    :param build_id: The build request's ``id``. Templated.
+    :param anakin_conn_id: Airflow connection id for :class:`AnakinHook`.
+    """
+
+    template_fields: Sequence[str] = ("build_id",)
+    ui_color = "#6b4fbb"
+
+    def __init__(
+        self,
+        *,
+        build_id: str,
+        anakin_conn_id: str = AnakinHook.default_conn_name,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.build_id = build_id
+        self.anakin_conn_id = anakin_conn_id
+
+    def execute(self, context: Context) -> dict[str, Any]:
+        hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
+        return hook.wire_build_status(self.build_id).model_dump(mode="json")
 
 
 class AnakinMonitorCreateOperator(BaseOperator):
@@ -729,7 +827,7 @@ class AnakinMonitorCreateOperator(BaseOperator):
 
     def execute(self, context: Context) -> dict[str, Any]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.monitor_create(
+        monitor = hook.monitor_create(
             self.url,
             self.interval_minutes,
             scope=self.scope,
@@ -755,6 +853,7 @@ class AnakinMonitorCreateOperator(BaseOperator):
             wire_params=self.wire_params,
             wire_watch_paths=self.wire_watch_paths,
         )
+        return monitor.model_dump(mode="json")
 
 
 class AnakinMonitorListOperator(BaseOperator):
@@ -777,9 +876,9 @@ class AnakinMonitorListOperator(BaseOperator):
         super().__init__(**kwargs)
         self.anakin_conn_id = anakin_conn_id
 
-    def execute(self, context: Context) -> dict[str, Any]:
+    def execute(self, context: Context) -> list[dict[str, Any]]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.monitor_list()
+        return _to_xcom(hook.monitor_list())  # type: ignore[no-any-return]
 
 
 class AnakinMonitorChangesOperator(BaseOperator):
@@ -808,9 +907,9 @@ class AnakinMonitorChangesOperator(BaseOperator):
         self.monitor_id = monitor_id
         self.anakin_conn_id = anakin_conn_id
 
-    def execute(self, context: Context) -> dict[str, Any]:
+    def execute(self, context: Context) -> list[dict[str, Any]]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.monitor_changes(self.monitor_id)
+        return _to_xcom(hook.monitor_changes(self.monitor_id))  # type: ignore[no-any-return]
 
 
 class AnakinMonitorControlOperator(BaseOperator):
@@ -844,7 +943,11 @@ class AnakinMonitorControlOperator(BaseOperator):
 
     def execute(self, context: Context) -> dict[str, Any]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.monitor_control(self.monitor_id, self.action)
+        result = hook.monitor_control(self.monitor_id, self.action)
+        if result is None:
+            # `delete` returns nothing on success; push a small, useful payload.
+            return {"monitor_id": self.monitor_id, "deleted": True}
+        return result.model_dump(mode="json")
 
 
 class AnakinAiVisibilitySearchOperator(BaseOperator):
@@ -853,9 +956,9 @@ class AnakinAiVisibilitySearchOperator(BaseOperator):
     Submits ``POST /ai-visibility/search`` and polls
     ``GET /ai-visibility/search/:id`` until the run leaves ``"running"``.
     Returns one result per engine (status, answer summary, latency,
-    consensus/outlier verdict) plus an AI-generated synthesis. A
-    ``"failed"`` run is still returned (not raised) — it carries whichever
-    per-source results/errors did come back.
+    consensus/outlier verdict) plus an AI-generated synthesis. Sources
+    that failed are reported in their result entry; the task only fails
+    (``anakin.JobFailedError``) when every source failed.
 
     :param query: The question to ask every engine (max 2000 characters). Templated.
     :param sources: Engine slugs to query (see
@@ -878,7 +981,7 @@ class AnakinAiVisibilitySearchOperator(BaseOperator):
         *,
         query: str,
         sources: Sequence[str] | None = None,
-        country: str | None = None,
+        country: str = "us",
         include_full_content: bool = False,
         poll_timeout: float | None = None,
         anakin_conn_id: str = AnakinHook.default_conn_name,
@@ -894,12 +997,12 @@ class AnakinAiVisibilitySearchOperator(BaseOperator):
 
     def execute(self, context: Context) -> dict[str, Any]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        result = hook.ai_visibility_search(
+        result: dict[str, Any] = hook.ai_visibility_search(
             self.query,
             sources=self.sources,
             country=self.country,
             poll_timeout=self.poll_timeout,
-        )
+        ).model_dump(mode="json")
         if not self.include_full_content:
             results = result.get("results")
             if isinstance(results, list):
@@ -935,9 +1038,9 @@ class AnakinAiVisibilitySourcesOperator(BaseOperator):
         super().__init__(**kwargs)
         self.anakin_conn_id = anakin_conn_id
 
-    def execute(self, context: Context) -> dict[str, Any]:
+    def execute(self, context: Context) -> list[dict[str, Any]]:
         hook = AnakinHook(anakin_conn_id=self.anakin_conn_id)
-        return hook.ai_visibility_sources()
+        return _to_xcom(hook.ai_visibility_sources())  # type: ignore[no-any-return]
 
 
 class AnakinSessionListOperator(BaseOperator):
@@ -1038,9 +1141,8 @@ class AnakinBrowserTaskOperator(BaseOperator):
         ~330s regardless).
     :param output_schema: JSON Schema for the result — the agent returns
         structured data conforming to it.
-    :param poll_timeout: Seconds to wait for the job to finish; falls back
-        to the SDK client's own default (300s) when unset. Note the
-        underlying job itself may run up to ~5.5 minutes server-side.
+    :param poll_timeout: Seconds to wait for the job to finish. Defaults to
+        360s, since the job itself may run up to ~5.5 minutes server-side.
     :param anakin_conn_id: Airflow connection id for :class:`AnakinHook`.
     """
 
