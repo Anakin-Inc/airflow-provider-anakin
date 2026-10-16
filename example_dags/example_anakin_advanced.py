@@ -1,6 +1,6 @@
-"""Example DAG for the 18 operators added on top of the original
-scrape/search/agentic-search trio — see ``example_dags/example_anakin.py``
-for those.
+"""Example DAG for the Wire, monitoring, AI-visibility, session and
+browser-task operators — see ``example_dags/example_anakin.py`` for
+scrape/search/agentic-search.
 
 Not part of the installable package (not under ``anakin_provider/``) —
 provided for reference the same way community providers ship
@@ -39,6 +39,7 @@ from anakin_provider.operators.anakin import (
     AnakinSessionDeleteOperator,
     AnakinSessionListOperator,
     AnakinWireBuildOperator,
+    AnakinWireBuildStatusOperator,
     AnakinWireCatalogOperator,
     AnakinWireDiscoverOperator,
     AnakinWireIdentitiesOperator,
@@ -73,6 +74,7 @@ with DAG(
     discover_wire_action = AnakinWireDiscoverOperator(
         task_id="discover_wire_action",
         q="search products on walmart",
+        auth_mode="none",
         limit=5,
     )
 
@@ -83,14 +85,17 @@ with DAG(
 
     run_wire_read_action = AnakinWireReadActionOperator(
         task_id="run_wire_read_action",
-        action_id="walmart.search_products",
-        params={"query": "wireless headphones"},
+        # Top match from the discovery task above.
+        action_id="{{ ti.xcom_pull(task_ids='discover_wire_action')[0]['action_id'] }}",
+        action_params={"query": "wireless headphones"},
     )
 
     run_wire_write_action = AnakinWireWriteActionOperator(
         task_id="run_wire_write_action",
         action_id="walmart.add_to_cart",
-        params={"product_id": "PLACEHOLDER_SKU", "quantity": 1},
+        action_params={"product_id": "PLACEHOLDER_SKU", "quantity": 1},
+        # Auth-required actions take the credential returned by wire_login.
+        credential_id="{{ ti.xcom_pull(task_ids='wire_login')['credential_id'] }}",
     )
 
     list_wire_identities = AnakinWireIdentitiesOperator(
@@ -100,13 +105,19 @@ with DAG(
     wire_login = AnakinWireLoginOperator(
         task_id="wire_login",
         catalog_slug="neb",
-        params={"email": "PLACEHOLDER_EMAIL", "password": "PLACEHOLDER_PASSWORD"},
+        # Read secrets from a Connection/Secrets Backend in a real DAG.
+        login_params={"email": "PLACEHOLDER_EMAIL", "password": "PLACEHOLDER_PASSWORD"},
     )
 
     request_new_wire_action = AnakinWireBuildOperator(
         task_id="request_new_wire_action",
         website_url="https://example.com",
         goal="Extract the product name, price, and stock status from a product page.",
+    )
+
+    check_wire_build = AnakinWireBuildStatusOperator(
+        task_id="check_wire_build",
+        build_id="{{ ti.xcom_pull(task_ids='request_new_wire_action')['id'] }}",
     )
 
     # ─── Website monitoring ─────────────────────────────────────────────────
@@ -162,7 +173,7 @@ with DAG(
     map_site >> crawl_site
     discover_wire_action >> browse_wire_catalog >> run_wire_read_action
     list_wire_identities >> wire_login >> run_wire_write_action
-    run_wire_write_action >> request_new_wire_action
+    run_wire_write_action >> request_new_wire_action >> check_wire_build
     create_monitor >> list_monitors >> get_monitor_changes >> pause_monitor
     list_ai_visibility_sources >> compare_ai_answers
     list_sessions >> delete_session
